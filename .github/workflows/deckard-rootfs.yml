@@ -150,7 +150,7 @@ jobs:
           curl --fail --location --retry 5 --retry-all-errors \
             --connect-timeout 30 --max-time 300 \
             "${base}${BUNDLE_PATH}" --output upstream.raucb
-          unsquashfs -d bundle upstream.raucb
+          unsquashfs -linfo -no-progress -d bundle upstream.raucb
           test -s bundle/rootfs.img.caibx
           # The channel JSON names the shared remote casync chunk store.
           casync --verbose --log-level=info extract \
