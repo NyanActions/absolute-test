@@ -214,7 +214,7 @@ jobs:
           Upstream version: ${VERSION}; build: ${BUILDID}; resolved branch: ${UPSTREAM_BRANCH}.
           Source RAUC bundle: https://holo-images.steamos.cloud/${BUNDLE_PATH}
 
-          Download every `.part-*` file and reconstruct the compressed image:
+          Download every \`.part-*\` file and reconstruct the compressed image:
 
           \`cat *.part-* > rootfs.img.zst\`
           \`zstd -d rootfs.img.zst -o rootfs.img\`
