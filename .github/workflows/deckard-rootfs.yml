@@ -138,8 +138,21 @@ jobs:
       - name: Install image tools
         if: steps.release.outputs.build == 'true'
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends casync squashfs-tools zstd
+          sudo apt-get install -y --no-install-recommends squashfs-tools zstd
+          # Pin the Linux runner binary and verify the publisher's release checksum.
+          archive="${RUNNER_TEMP}/desync_1.1.4_linux_amd64.tar.gz"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --connect-timeout 30 --max-time 300 \
+            https://github.com/folbricht/desync/releases/download/v1.1.4/desync_1.1.4_linux_amd64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            '5f9153351383907b513f3dbb0cf21c86b85d4cda267be9898aed25f799ae9706' \
+            "$archive" | sha256sum --check
+          mkdir -p "${RUNNER_TEMP}/desync-bin"
+          tar -xzf "$archive" -C "${RUNNER_TEMP}/desync-bin" desync
+          printf '%s\n' "${RUNNER_TEMP}/desync-bin" >> "$GITHUB_PATH"
 
       - name: Reconstruct the upstream rootfs image
         if: steps.release.outputs.build == 'true'
@@ -153,10 +166,27 @@ jobs:
           unsquashfs -linfo -no-progress -d bundle upstream.raucb
           test -s bundle/rootfs.img.caibx
           # The channel JSON names the shared remote casync chunk store.
-          casync --verbose --log-level=info extract \
-            --store="${base}${STORE_PATH}" \
-            bundle/rootfs.img.caibx rootfs.img
-          test -s rootfs.img
+          # desync reads the same caibx/castr format and fetches chunks in parallel.
+          for attempt in 1 2 3; do
+            echo "desync extract attempt ${attempt}/3"
+            if desync extract --store="${base}${STORE_PATH}" \
+              --concurrency 16 --error-retry 5 --error-retry-base-interval 2s \
+              --in-place --print-stats bundle/rootfs.img.caibx rootfs.img; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              echo 'desync extract failed after 3 attempts' >&2
+              exit 1
+            fi
+            echo 'desync extract failed; retrying in 60 seconds' >&2
+            df -h .
+            sleep 60
+          done
+          if [[ ! -s rootfs.img ]]; then
+            echo 'desync did not create rootfs.img in the working directory' >&2
+            exit 1
+          fi
+          desync verify-index bundle/rootfs.img.caibx rootfs.img
           file rootfs.img
           sha256sum rootfs.img > dist/ROOTFS-SHA256.txt
 
