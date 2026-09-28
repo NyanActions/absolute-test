@@ -151,9 +151,12 @@ jobs:
             --connect-timeout 30 --max-time 300 \
             "${base}${BUNDLE_PATH}" --output upstream.raucb
           unsquashfs -d bundle upstream.raucb
+          test -s bundle/rootfs.img.caibx
           # The channel JSON names the shared remote casync chunk store.
-          casync extract --store="${base}${STORE_PATH}" \
+          casync --verbose --log-level=info extract \
+            --store="${base}${STORE_PATH}" \
             bundle/rootfs.img.caibx rootfs.img
+          test -s bundle/rootfs.img
           file rootfs.img
           sha256sum rootfs.img > dist/ROOTFS-SHA256.txt
 
