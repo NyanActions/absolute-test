@@ -156,7 +156,7 @@ jobs:
           casync --verbose --log-level=info extract \
             --store="${base}${STORE_PATH}" \
             bundle/rootfs.img.caibx rootfs.img
-          test -s bundle/rootfs.img
+          test -s rootfs.img
           file rootfs.img
           sha256sum rootfs.img > dist/ROOTFS-SHA256.txt
 
