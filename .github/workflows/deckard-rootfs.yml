@@ -1,0 +1,213 @@
+name: SteamOS VR channel rootfs images
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Channel name from upstream metadata, or all'
+        required: true
+        default: all
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: steamos-vr-images
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.upstream.outputs.matrix }}
+      count: ${{ steps.upstream.outputs.count }}
+    steps:
+      - name: Find current builds for each update channel
+        id: upstream
+        env:
+          REQUESTED_CHANNEL: ${{ inputs.channel || 'all' }}
+        run: |
+          python3 - <<'PY'
+          import html.parser
+          import json
+          import os
+          import re
+          import urllib.request
+
+          metadata_url = 'https://holo-atomupd.steamos.cloud/meta/holo/steamos/aarch64/vr/'
+
+          def fetch(url):
+              request = urllib.request.Request(url, headers={'User-Agent': 'steamos-vr-release-workflow'})
+              with urllib.request.urlopen(request, timeout=45) as response:
+                  return response.read()
+
+          class Links(html.parser.HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.hrefs = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag == 'a':
+                      self.hrefs.extend(value for key, value in attrs if key == 'href')
+
+          links = Links()
+          links.feed(fetch(metadata_url).decode('utf-8'))
+          channels = sorted({link[:-5] for link in links.hrefs
+                             if re.fullmatch(r'[a-z][a-z0-9_-]*\.json', link)
+                             and link != 'builds.json'})
+          requested = os.environ['REQUESTED_CHANNEL'].strip()
+          if requested != 'all' and requested not in channels:
+              raise SystemExit(f'Unknown channel {requested!r}; available: {", ".join(channels)}')
+
+          matrix = []
+          for channel in channels:
+              if requested != 'all' and requested != channel:
+                  continue
+              metadata = json.loads(fetch(metadata_url + channel + '.json'))
+              candidates = [candidate for group in metadata.values()
+                            if isinstance(group, dict)
+                            for candidate in group.get('candidates', [])]
+              if not candidates:
+                  print(f'{channel}: no published candidate; skipping')
+                  continue
+              candidate = max(candidates, key=lambda item: tuple(
+                  int(part) for part in item['image']['buildid'].split('.')))
+              image = candidate['image']
+              buildid = image['buildid']
+              version = image['version']
+              bundle = candidate['update_path']
+              store = candidate['chunks_store_path']
+              if (not re.fullmatch(r'\d{8}\.\d+', buildid)
+                      or not re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,3}', version)
+                      or not re.fullmatch(r'vr/' + re.escape(buildid) + r'/[A-Za-z0-9_.-]+\.raucb', bundle)
+                      or not re.fullmatch(r'vr/[A-Za-z0-9_./-]+\.castr', store)
+                      or any(image.get(key) != value for key, value in {
+                          'release': 'holo', 'product': 'steamos',
+                          'arch': 'aarch64', 'variant': 'vr'}.items())):
+                  raise SystemExit(f'Unexpected metadata for channel {channel}: {candidate}')
+              matrix.append({'channel': channel, 'version': version,
+                             'buildid': buildid, 'branch': image['branch'],
+                             'bundle': bundle, 'store': store})
+              print(f'{channel}: {version} ({buildid}), upstream branch {image["branch"]}')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              print('matrix=' + json.dumps({'include': matrix}, separators=(',', ':')), file=output)
+              print('count=' + str(len(matrix)), file=output)
+          PY
+
+  build-and-release:
+    needs: discover
+    if: ${{ needs.discover.outputs.count != '0' }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      CHANNEL: ${{ matrix.channel }}
+      VERSION: ${{ matrix.version }}
+      BUILDID: ${{ matrix.buildid }}
+      UPSTREAM_BRANCH: ${{ matrix.branch }}
+      BUNDLE_PATH: ${{ matrix.bundle }}
+      STORE_PATH: ${{ matrix.store }}
+      TAG: vr-${{ matrix.channel }}-${{ matrix.version }}-${{ matrix.buildid }}
+    steps:
+      - name: Check whether the channel release is complete
+        id: release
+        uses: actions/github-script@v8
+        with:
+          script: |
+            try {
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                ...context.repo, tag: process.env.TAG
+              });
+              const complete = !release.draft &&
+                release.assets.some(asset => asset.name === 'SHA256SUMS');
+              core.setOutput('build', String(!complete));
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              core.setOutput('build', 'true');
+            }
+
+      - name: Install image tools
+        if: steps.release.outputs.build == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends casync squashfs-tools zstd
+
+      - name: Reconstruct the upstream rootfs image
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p bundle dist
+          base='https://holo-images.steamos.cloud/'
+          curl --fail --location --retry 5 --retry-all-errors \
+            --connect-timeout 30 --max-time 300 \
+            "${base}${BUNDLE_PATH}" --output upstream.raucb
+          unsquashfs -no-progress -d bundle upstream.raucb
+          test -s bundle/rootfs.img.caibx
+          # The channel JSON names the shared remote casync chunk store.
+          casync extract --store="${base}${STORE_PATH}" \
+            bundle/rootfs.img.caibx rootfs.img
+          test -s rootfs.img
+          file rootfs.img
+          sha256sum rootfs.img > dist/ROOTFS-SHA256.txt
+
+          # GitHub Releases accepts assets smaller than 2 GiB each.
+          zstd -T0 -5 -c rootfs.img | split -b 1900M -d -a 3 \
+            - "dist/steamos-vr-${CHANNEL}-${VERSION}-${BUILDID}-rootfs.img.zst.part-"
+          test -n "$(find dist -maxdepth 1 -name '*.part-*' -print -quit)"
+          sha256sum dist/*.part-* | sed 's|dist/||' > dist/SHA256SUMS
+
+      - name: Prepare release details
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg channel "$CHANNEL" --arg branch "$UPSTREAM_BRANCH" \
+            --arg version "$VERSION" --arg buildid "$BUILDID" \
+            --arg bundle "https://holo-images.steamos.cloud/${BUNDLE_PATH}" \
+            --arg store "https://holo-images.steamos.cloud/${STORE_PATH}" \
+            '{channel:$channel, upstream_branch:$branch, version:$version,
+              buildid:$buildid, bundle_url:$bundle, chunks_store_url:$store,
+              image_type:"rootfs partition image"}' > dist/build-info.json
+          cat > release-notes.md <<EOF
+          SteamOS VR aarch64 root filesystem image for update channel ${CHANNEL}.
+
+          Upstream version: ${VERSION}; build: ${BUILDID}; resolved branch: ${UPSTREAM_BRANCH}.
+          Source RAUC bundle: https://holo-images.steamos.cloud/${BUNDLE_PATH}
+
+          Download every `.part-*` file and reconstruct the compressed image:
+
+          \`cat *.part-* > rootfs.img.zst\`
+          \`zstd -d rootfs.img.zst -o rootfs.img\`
+
+          Check the parts with \`sha256sum -c SHA256SUMS\` and compare the
+          reconstructed image against \`ROOTFS-SHA256.txt\`.
+
+          This is a rootfs partition image, not a bootable whole-disk image.
+          EOF
+
+      - name: Upload channel release
+        if: steps.release.outputs.build == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: SteamOS VR ${{ matrix.channel }} ${{ matrix.version }} (${{ matrix.buildid }})
+          body_path: release-notes.md
+          prerelease: ${{ matrix.channel != 'stable' }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          preserve_order: true
+          files: |
+            dist/*.part-*
+            dist/build-info.json
+            dist/ROOTFS-SHA256.txt
+            dist/SHA256SUMS
